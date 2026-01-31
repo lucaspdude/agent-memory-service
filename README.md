@@ -18,6 +18,8 @@ https://web-production-5d142.up.railway.app
 | `/api/metrics` | GET | System metrics (CPU, memory, disk) |
 | `/api/echo` | POST | Echo message with transformation |
 | `/api/random` | GET | Generate random UUIDs and tokens |
+| `/api/hash/{data}` | GET | Generate hash of input data (sha256, sha512, md5, etc.) |
+| `/api/ip` | GET | Get client IP and connection info |
 | `/docs` | GET | Interactive API documentation |
 
 ## Local Development

@@ -31,7 +31,7 @@ class EchoResponse(BaseModel):
 app = FastAPI(
     title="OpenClaw Experiment",
     description="A FastAPI application for testing Railway deployments",
-    version="1.2.0"
+    version="1.3.0"
 )
 
 # Add CORS middleware
@@ -58,7 +58,7 @@ async def root():
     return {
         "message": "OpenClaw Experiment is running!",
         "status": "healthy",
-        "version": "1.2.0",
+        "version": "1.3.0",
         "docs": "/docs",
         "endpoints": [
             "/health",
@@ -67,7 +67,9 @@ async def root():
             "/api/headers",
             "/api/metrics",
             "/api/echo (POST)",
-            "/api/random"
+            "/api/random",
+            "/api/hash/{data}",
+            "/api/ip"
         ]
     }
 
@@ -77,7 +79,7 @@ async def health():
         "status": "ok",
         "timestamp": datetime.utcnow().isoformat(),
         "service": "openclaw-experiment",
-        "version": "1.2.0"
+        "version": "1.3.0"
     }
 
 @app.get("/api/info")
@@ -86,14 +88,16 @@ async def info():
         "project": "openclaw-experiment",
         "description": "A test deployment for Railway",
         "environment": os.environ.get("RAILWAY_ENVIRONMENT", "development"),
-        "version": "1.2.0",
+        "version": "1.3.0",
         "python_version": os.sys.version,
         "features": [
             "Health checks",
             "Request header echo",
             "System metrics",
             "Message echo with transformation",
-            "Random token generation"
+            "Random token generation",
+            "Hash generation (SHA-256, SHA-512, etc.)",
+            "Client IP detection"
         ]
     }
 
@@ -141,7 +145,7 @@ async def get_metrics():
                 }
             },
             "app": {
-                "version": "1.2.0",
+                "version": "1.3.0",
                 "environment": os.environ.get("RAILWAY_ENVIRONMENT", "development"),
                 "service_name": os.environ.get("RAILWAY_SERVICE_NAME", "unknown")
             },
@@ -187,6 +191,49 @@ async def get_random():
         "uuidv4": str(uuid.uuid4()),
         "token": secrets.token_urlsafe(32),
         "hex": secrets.token_hex(16),
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+@app.get("/api/hash/{data}")
+async def get_hash(data: str, algorithm: str = "sha256"):
+    """Generate hash of input data using specified algorithm"""
+    import hashlib
+    
+    algorithms = ["sha256", "sha512", "md5", "sha1", "blake2b"]
+    
+    if algorithm not in algorithms:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Unsupported algorithm. Use one of: {', '.join(algorithms)}"
+        )
+    
+    hasher = hashlib.new(algorithm)
+    hasher.update(data.encode('utf-8'))
+    
+    return {
+        "input": data,
+        "algorithm": algorithm,
+        "hash": hasher.hexdigest(),
+        "length": hasher.digest_size * 8,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+@app.get("/api/ip")
+async def get_ip(request: Request):
+    """Get client IP address and connection info"""
+    # Get forwarded IP if behind proxy
+    forwarded_for = request.headers.get("x-forwarded-for")
+    real_ip = request.headers.get("x-real-ip")
+    
+    client_ip = forwarded_for.split(",")[0].strip() if forwarded_for else \
+                real_ip if real_ip else \
+                request.client.host if request.client else None
+    
+    return {
+        "ip": client_ip,
+        "user_agent": request.headers.get("user-agent"),
+        "accept_language": request.headers.get("accept-language"),
+        "secure": request.url.scheme == "https",
         "timestamp": datetime.utcnow().isoformat()
     }
 
