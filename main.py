@@ -704,11 +704,11 @@ async def get_stats():
                 cur.execute("SELECT COUNT(*) as memory_count FROM memory_snapshots")
                 memory_count = cur.fetchone()['memory_count']
                 
-                cur.execute("SELECT AVG(version) as avg_versions FROM (
+                cur.execute("""SELECT AVG(version) as avg_versions FROM (
                     SELECT agent_id, MAX(version) as version 
                     FROM memory_snapshots 
                     GROUP BY agent_id
-                ) sub")
+                ) sub""")
                 avg_versions = cur.fetchone()['avg_versions'] or 0
         finally:
             conn.close()
