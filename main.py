@@ -520,7 +520,7 @@ async def retrieve_memory(request: MemoryRetrieveRequest):
                 """SELECT encrypted_data, data_hash, version, created_at
                    FROM memory_snapshots 
                    WHERE agent_id = ? 
-                   ORDER BY created_at DESC 
+                   ORDER BY version DESC, created_at DESC 
                    LIMIT 1""",
                 (request.agent_id,)
             )
