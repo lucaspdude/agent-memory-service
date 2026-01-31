@@ -21,7 +21,8 @@ import time
 import logging
 import hashlib
 import base64
-import sqlite3
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey, Ed25519PublicKey
@@ -36,52 +37,51 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Database setup
-DB_PATH = os.environ.get("DB_PATH", "/data/agent_memory.db")
-os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+# Database connection
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    # Fallback for local development
+    DATABASE_URL = "postgresql://user:password@localhost:5432/agent_memory"
 
 def get_db_connection():
     """Get database connection"""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 def init_db():
     """Initialize database tables"""
     conn = get_db_connection()
     try:
-        cur = conn.cursor()
-        
-        # Agents table
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS agents (
-                agent_id TEXT PRIMARY KEY,
-                public_key TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_access TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        # Memory snapshots table
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS memory_snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                agent_id TEXT REFERENCES agents(agent_id) ON DELETE CASCADE,
-                encrypted_data TEXT NOT NULL,
-                data_hash TEXT NOT NULL,
-                version INTEGER DEFAULT 1,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        # Create index for faster lookups
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_memory_agent_id 
-            ON memory_snapshots(agent_id, created_at DESC)
-        """)
-        
-        conn.commit()
-        logger.info(f"Database initialized at {DB_PATH}")
+        with conn.cursor() as cur:
+            # Agents table
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS agents (
+                    agent_id VARCHAR(64) PRIMARY KEY,
+                    public_key TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_access TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # Memory snapshots table
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS memory_snapshots (
+                    id SERIAL PRIMARY KEY,
+                    agent_id VARCHAR(64) REFERENCES agents(agent_id) ON DELETE CASCADE,
+                    encrypted_data TEXT NOT NULL,
+                    data_hash VARCHAR(64) NOT NULL,
+                    version INTEGER DEFAULT 1,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # Create index for faster lookups
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_memory_agent_id 
+                ON memory_snapshots(agent_id, created_at DESC)
+            """)
+            
+            conn.commit()
+            logger.info("Database initialized successfully")
     except Exception as e:
         logger.error(f"Database initialization error: {e}")
         conn.rollback()
@@ -268,7 +268,8 @@ async def health():
     db_status = "connected"
     try:
         conn = get_db_connection()
-        conn.execute("SELECT 1")
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
         conn.close()
     except Exception as e:
         db_status = f"error: {str(e)}"
@@ -311,7 +312,7 @@ async def register_agent():
         try:
             cur = conn.cursor()
             cur.execute(
-                "INSERT INTO agents (agent_id, public_key) VALUES (?, ?)",
+                "INSERT INTO agents (agent_id, public_key) VALUES (%s, %s)",
                 (agent_id, base64.b64encode(public_bytes).decode())
             )
             conn.commit()
@@ -354,7 +355,7 @@ async def recover_agent(request: AgentRecoveryRequest):
         try:
             cur = conn.cursor()
             cur.execute(
-                "SELECT public_key FROM agents WHERE agent_id = ?",
+                "SELECT public_key FROM agents WHERE agent_id = %s",
                 (agent_id,)
             )
             result = cur.fetchone()
@@ -375,7 +376,7 @@ async def recover_agent(request: AgentRecoveryRequest):
             
             # Update last access
             cur.execute(
-                "UPDATE agents SET last_access = CURRENT_TIMESTAMP WHERE agent_id = ?",
+                "UPDATE agents SET last_access = CURRENT_TIMESTAMP WHERE agent_id = %s",
                 (agent_id,)
             )
             conn.commit()
@@ -410,7 +411,7 @@ async def store_memory(request: MemoryStoreRequest):
         try:
             cur = conn.cursor()
             cur.execute(
-                "SELECT public_key FROM agents WHERE agent_id = ?",
+                "SELECT public_key FROM agents WHERE agent_id = %s",
                 (request.agent_id,)
             )
             result = cur.fetchone()
@@ -442,7 +443,7 @@ async def store_memory(request: MemoryStoreRequest):
             cur = conn.cursor()
             cur.execute(
                 "SELECT COALESCE(MAX(version), 0) + 1 as next_version "
-                "FROM memory_snapshots WHERE agent_id = ?",
+                "FROM memory_snapshots WHERE agent_id = %s",
                 (request.agent_id,)
             )
             version = cur.fetchone()['next_version']
@@ -451,7 +452,7 @@ async def store_memory(request: MemoryStoreRequest):
             cur.execute(
                 """INSERT INTO memory_snapshots 
                    (agent_id, encrypted_data, data_hash, version) 
-                   VALUES (?, ?, ?, ?)""",
+                   VALUES (%s, %s, %s, %s)""",
                 (request.agent_id, request.encrypted_data, data_hash, version)
             )
             conn.commit()
@@ -487,7 +488,7 @@ async def retrieve_memory(request: MemoryRetrieveRequest):
         try:
             cur = conn.cursor()
             cur.execute(
-                "SELECT public_key FROM agents WHERE agent_id = ?",
+                "SELECT public_key FROM agents WHERE agent_id = %s",
                 (request.agent_id,)
             )
             result = cur.fetchone()
@@ -519,7 +520,7 @@ async def retrieve_memory(request: MemoryRetrieveRequest):
             cur.execute(
                 """SELECT encrypted_data, data_hash, version, created_at
                    FROM memory_snapshots 
-                   WHERE agent_id = ? 
+                   WHERE agent_id = %s 
                    ORDER BY created_at DESC 
                    LIMIT 1""",
                 (request.agent_id,)
@@ -561,7 +562,7 @@ async def list_memory_history(request: MemoryRetrieveRequest):
         try:
             cur = conn.cursor()
             cur.execute(
-                "SELECT public_key FROM agents WHERE agent_id = ?",
+                "SELECT public_key FROM agents WHERE agent_id = %s",
                 (request.agent_id,)
             )
             result = cur.fetchone()
@@ -593,7 +594,7 @@ async def list_memory_history(request: MemoryRetrieveRequest):
             cur.execute(
                 """SELECT encrypted_data, data_hash, version, created_at
                    FROM memory_snapshots 
-                   WHERE agent_id = ? 
+                   WHERE agent_id = %s 
                    ORDER BY created_at DESC""",
                 (request.agent_id,)
             )
@@ -636,7 +637,7 @@ async def clear_memory(request: MemoryRetrieveRequest):
         try:
             cur = conn.cursor()
             cur.execute(
-                "SELECT public_key FROM agents WHERE agent_id = ?",
+                "SELECT public_key FROM agents WHERE agent_id = %s",
                 (request.agent_id,)
             )
             result = cur.fetchone()
@@ -666,7 +667,7 @@ async def clear_memory(request: MemoryRetrieveRequest):
         try:
             cur = conn.cursor()
             cur.execute(
-                "DELETE FROM memory_snapshots WHERE agent_id = ?",
+                "DELETE FROM memory_snapshots WHERE agent_id = %s",
                 (request.agent_id,)
             )
             deleted = cur.rowcount
