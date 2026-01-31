@@ -8,14 +8,17 @@ https://web-production-5d142.up.railway.app
 
 ## API Endpoints
 
-| Endpoint | Description |
-|----------|-------------|
-| `GET /` | Root - basic info and health |
-| `GET /health` | Health check with timestamp |
-| `GET /api/info` | Project information |
-| `GET /api/time` | Current server time (UTC) |
-| `GET /api/headers` | Echo request headers |
-| `GET /docs` | Interactive API documentation |
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/` | GET | Root - basic info and health |
+| `/health` | GET | Health check with timestamp |
+| `/api/info` | GET | Project information |
+| `/api/time` | GET | Current server time (UTC) |
+| `/api/headers` | GET | Echo request headers |
+| `/api/metrics` | GET | System metrics (CPU, memory, disk) |
+| `/api/echo` | POST | Echo message with transformation |
+| `/api/random` | GET | Generate random UUIDs and tokens |
+| `/docs` | GET | Interactive API documentation |
 
 ## Local Development
 
