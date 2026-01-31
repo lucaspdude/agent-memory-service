@@ -10,21 +10,19 @@ A persistent memory service for AI agents. Agents can:
 All data is encrypted client-side. The service only stores opaque blobs.
 """
 
-from fastapi import FastAPI, Request, HTTPException, Depends, Header
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
 from pydantic import BaseModel, Field
-from typing import Optional, List
+from typing import List
 import os
 import time
 import logging
 import hashlib
 import base64
-import json
-import psycopg2
-from psycopg2.extras import RealDictCursor
-from cryptography.hazmat.primitives import serialization, hashes
+import sqlite3
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey, Ed25519PublicKey
 )
@@ -38,51 +36,52 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Database connection
-DATABASE_URL = os.environ.get("DATABASE_URL")
-if not DATABASE_URL:
-    # Fallback for local development
-    DATABASE_URL = "postgresql://user:password@localhost:5432/agent_memory"
+# Database setup
+DB_PATH = os.environ.get("DB_PATH", "/data/agent_memory.db")
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 def get_db_connection():
     """Get database connection"""
-    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 def init_db():
     """Initialize database tables"""
     conn = get_db_connection()
     try:
-        with conn.cursor() as cur:
-            # Agents table
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS agents (
-                    agent_id VARCHAR(64) PRIMARY KEY,
-                    public_key TEXT NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_access TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            
-            # Memory snapshots table
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS memory_snapshots (
-                    id SERIAL PRIMARY KEY,
-                    agent_id VARCHAR(64) REFERENCES agents(agent_id) ON DELETE CASCADE,
-                    encrypted_data TEXT NOT NULL,
-                    data_hash VARCHAR(64) NOT NULL,
-                    version INTEGER DEFAULT 1,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            
-            # Create index for faster lookups
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_memory_agent_id 
-                ON memory_snapshots(agent_id, created_at DESC)
-            """)
-            
-            conn.commit()
-            logger.info("Database initialized successfully")
+        cur = conn.cursor()
+        
+        # Agents table
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS agents (
+                agent_id TEXT PRIMARY KEY,
+                public_key TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_access TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Memory snapshots table
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS memory_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT REFERENCES agents(agent_id) ON DELETE CASCADE,
+                encrypted_data TEXT NOT NULL,
+                data_hash TEXT NOT NULL,
+                version INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Create index for faster lookups
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_memory_agent_id 
+            ON memory_snapshots(agent_id, created_at DESC)
+        """)
+        
+        conn.commit()
+        logger.info(f"Database initialized at {DB_PATH}")
     except Exception as e:
         logger.error(f"Database initialization error: {e}")
         conn.rollback()
@@ -269,6 +268,7 @@ async def health():
     db_status = "connected"
     try:
         conn = get_db_connection()
+        conn.execute("SELECT 1")
         conn.close()
     except Exception as e:
         db_status = f"error: {str(e)}"
@@ -309,12 +309,12 @@ async def register_agent():
         # Store in database
         conn = get_db_connection()
         try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO agents (agent_id, public_key) VALUES (%s, %s)",
-                    (agent_id, base64.b64encode(public_bytes).decode())
-                )
-                conn.commit()
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO agents (agent_id, public_key) VALUES (?, ?)",
+                (agent_id, base64.b64encode(public_bytes).decode())
+            )
+            conn.commit()
         finally:
             conn.close()
         
@@ -352,33 +352,33 @@ async def recover_agent(request: AgentRecoveryRequest):
         # Verify agent exists in database
         conn = get_db_connection()
         try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT public_key FROM agents WHERE agent_id = %s",
-                    (agent_id,)
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT public_key FROM agents WHERE agent_id = ?",
+                (agent_id,)
+            )
+            result = cur.fetchone()
+            
+            if not result:
+                raise HTTPException(
+                    status_code=404, 
+                    detail="Agent not found. This recovery phrase is not registered."
                 )
-                result = cur.fetchone()
-                
-                if not result:
-                    raise HTTPException(
-                        status_code=404, 
-                        detail="Agent not found. This recovery phrase is not registered."
-                    )
-                
-                # Verify public key matches
-                stored_public = base64.b64decode(result['public_key'])
-                if stored_public != public_bytes:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Key mismatch. Invalid recovery phrase."
-                    )
-                
-                # Update last access
-                cur.execute(
-                    "UPDATE agents SET last_access = CURRENT_TIMESTAMP WHERE agent_id = %s",
-                    (agent_id,)
+            
+            # Verify public key matches
+            stored_public = base64.b64decode(result['public_key'])
+            if stored_public != public_bytes:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Key mismatch. Invalid recovery phrase."
                 )
-                conn.commit()
+            
+            # Update last access
+            cur.execute(
+                "UPDATE agents SET last_access = CURRENT_TIMESTAMP WHERE agent_id = ?",
+                (agent_id,)
+            )
+            conn.commit()
         finally:
             conn.close()
         
@@ -408,20 +408,20 @@ async def store_memory(request: MemoryStoreRequest):
         # Get agent's public key
         conn = get_db_connection()
         try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT public_key FROM agents WHERE agent_id = %s",
-                    (request.agent_id,)
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT public_key FROM agents WHERE agent_id = ?",
+                (request.agent_id,)
+            )
+            result = cur.fetchone()
+            
+            if not result:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Agent not found. Register first."
                 )
-                result = cur.fetchone()
-                
-                if not result:
-                    raise HTTPException(
-                        status_code=404,
-                        detail="Agent not found. Register first."
-                    )
-                
-                public_key_bytes = base64.b64decode(result['public_key'])
+            
+            public_key_bytes = base64.b64decode(result['public_key'])
         finally:
             conn.close()
         
@@ -439,23 +439,22 @@ async def store_memory(request: MemoryStoreRequest):
         # Get next version number
         conn = get_db_connection()
         try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT COALESCE(MAX(version), 0) + 1 as next_version "
-                    "FROM memory_snapshots WHERE agent_id = %s",
-                    (request.agent_id,)
-                )
-                version = cur.fetchone()['next_version']
-                
-                # Store memory
-                cur.execute(
-                    """INSERT INTO memory_snapshots 
-                       (agent_id, encrypted_data, data_hash, version) 
-                       VALUES (%s, %s, %s, %s)
-                       RETURNING id""",
-                    (request.agent_id, request.encrypted_data, data_hash, version)
-                )
-                conn.commit()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT COALESCE(MAX(version), 0) + 1 as next_version "
+                "FROM memory_snapshots WHERE agent_id = ?",
+                (request.agent_id,)
+            )
+            version = cur.fetchone()['next_version']
+            
+            # Store memory
+            cur.execute(
+                """INSERT INTO memory_snapshots 
+                   (agent_id, encrypted_data, data_hash, version) 
+                   VALUES (?, ?, ?, ?)""",
+                (request.agent_id, request.encrypted_data, data_hash, version)
+            )
+            conn.commit()
         finally:
             conn.close()
         
@@ -486,20 +485,20 @@ async def retrieve_memory(request: MemoryRetrieveRequest):
         # Get agent's public key
         conn = get_db_connection()
         try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT public_key FROM agents WHERE agent_id = %s",
-                    (request.agent_id,)
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT public_key FROM agents WHERE agent_id = ?",
+                (request.agent_id,)
+            )
+            result = cur.fetchone()
+            
+            if not result:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Agent not found."
                 )
-                result = cur.fetchone()
-                
-                if not result:
-                    raise HTTPException(
-                        status_code=404,
-                        detail="Agent not found."
-                    )
-                
-                public_key_bytes = base64.b64decode(result['public_key'])
+            
+            public_key_bytes = base64.b64decode(result['public_key'])
         finally:
             conn.close()
         
@@ -516,22 +515,22 @@ async def retrieve_memory(request: MemoryRetrieveRequest):
         # Get latest memory
         conn = get_db_connection()
         try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """SELECT encrypted_data, data_hash, version, created_at
-                       FROM memory_snapshots 
-                       WHERE agent_id = %s 
-                       ORDER BY created_at DESC 
-                       LIMIT 1""",
-                    (request.agent_id,)
+            cur = conn.cursor()
+            cur.execute(
+                """SELECT encrypted_data, data_hash, version, created_at
+                   FROM memory_snapshots 
+                   WHERE agent_id = ? 
+                   ORDER BY created_at DESC 
+                   LIMIT 1""",
+                (request.agent_id,)
+            )
+            result = cur.fetchone()
+            
+            if not result:
+                raise HTTPException(
+                    status_code=404,
+                    detail="No memory found for this agent."
                 )
-                result = cur.fetchone()
-                
-                if not result:
-                    raise HTTPException(
-                        status_code=404,
-                        detail="No memory found for this agent."
-                    )
         finally:
             conn.close()
         
@@ -560,20 +559,20 @@ async def list_memory_history(request: MemoryRetrieveRequest):
         # Get agent's public key
         conn = get_db_connection()
         try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT public_key FROM agents WHERE agent_id = %s",
-                    (request.agent_id,)
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT public_key FROM agents WHERE agent_id = ?",
+                (request.agent_id,)
+            )
+            result = cur.fetchone()
+            
+            if not result:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Agent not found."
                 )
-                result = cur.fetchone()
-                
-                if not result:
-                    raise HTTPException(
-                        status_code=404,
-                        detail="Agent not found."
-                    )
-                
-                public_key_bytes = base64.b64decode(result['public_key'])
+            
+            public_key_bytes = base64.b64decode(result['public_key'])
         finally:
             conn.close()
         
@@ -590,15 +589,15 @@ async def list_memory_history(request: MemoryRetrieveRequest):
         # Get all memories
         conn = get_db_connection()
         try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """SELECT encrypted_data, data_hash, version, created_at
-                       FROM memory_snapshots 
-                       WHERE agent_id = %s 
-                       ORDER BY created_at DESC""",
-                    (request.agent_id,)
-                )
-                results = cur.fetchall()
+            cur = conn.cursor()
+            cur.execute(
+                """SELECT encrypted_data, data_hash, version, created_at
+                   FROM memory_snapshots 
+                   WHERE agent_id = ? 
+                   ORDER BY created_at DESC""",
+                (request.agent_id,)
+            )
+            results = cur.fetchall()
         finally:
             conn.close()
         
@@ -607,7 +606,7 @@ async def list_memory_history(request: MemoryRetrieveRequest):
                 encrypted_data=r['encrypted_data'],
                 data_hash=r['data_hash'],
                 version=r['version'],
-                created_at=r['created_at'].isoformat()
+                created_at=r['created_at']
             )
             for r in results
         ]
@@ -635,20 +634,20 @@ async def clear_memory(request: MemoryRetrieveRequest):
         # Get agent's public key
         conn = get_db_connection()
         try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT public_key FROM agents WHERE agent_id = %s",
-                    (request.agent_id,)
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT public_key FROM agents WHERE agent_id = ?",
+                (request.agent_id,)
+            )
+            result = cur.fetchone()
+            
+            if not result:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Agent not found."
                 )
-                result = cur.fetchone()
-                
-                if not result:
-                    raise HTTPException(
-                        status_code=404,
-                        detail="Agent not found."
-                    )
-                
-                public_key_bytes = base64.b64decode(result['public_key'])
+            
+            public_key_bytes = base64.b64decode(result['public_key'])
         finally:
             conn.close()
         
@@ -665,13 +664,13 @@ async def clear_memory(request: MemoryRetrieveRequest):
         # Delete memories
         conn = get_db_connection()
         try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "DELETE FROM memory_snapshots WHERE agent_id = %s",
-                    (request.agent_id,)
-                )
-                deleted = cur.rowcount
-                conn.commit()
+            cur = conn.cursor()
+            cur.execute(
+                "DELETE FROM memory_snapshots WHERE agent_id = ?",
+                (request.agent_id,)
+            )
+            deleted = cur.rowcount
+            conn.commit()
         finally:
             conn.close()
         
@@ -698,19 +697,19 @@ async def get_stats():
     try:
         conn = get_db_connection()
         try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) as agent_count FROM agents")
-                agent_count = cur.fetchone()['agent_count']
-                
-                cur.execute("SELECT COUNT(*) as memory_count FROM memory_snapshots")
-                memory_count = cur.fetchone()['memory_count']
-                
-                cur.execute("""SELECT AVG(version) as avg_versions FROM (
-                    SELECT agent_id, MAX(version) as version 
-                    FROM memory_snapshots 
-                    GROUP BY agent_id
-                ) sub""")
-                avg_versions = cur.fetchone()['avg_versions'] or 0
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) as agent_count FROM agents")
+            agent_count = cur.fetchone()['agent_count']
+            
+            cur.execute("SELECT COUNT(*) as memory_count FROM memory_snapshots")
+            memory_count = cur.fetchone()['memory_count']
+            
+            cur.execute("""SELECT AVG(version) as avg_versions FROM (
+                SELECT agent_id, MAX(version) as version 
+                FROM memory_snapshots 
+                GROUP BY agent_id
+            ) sub""")
+            avg_versions = cur.fetchone()['avg_versions'] or 0
         finally:
             conn.close()
         
